@@ -1,0 +1,19 @@
+[package]
+name = "godot_atproto"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+godot = { version = "0.5.5", features = ["api-4-6"] }
+anyhow = "1"
+tokio = { version = "1", features = ["rt", "net", "io-util", "time"] }
+url = "2"
+atproto-identity = "0.14.5"
+atproto-oauth = "0.14.5"
+serde = "1"
+rand = "0.9"
+reqwest = "0.12.28"

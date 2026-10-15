@@ -1,20 +1,30 @@
-use std::net::TcpListener;
-use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
-use std::time::Duration;
+use std::{
+    net::TcpListener,
+    sync::mpsc::{self, Receiver, Sender, TryRecvError},
+    time::Duration,
+};
 
 use anyhow::{Context, anyhow, bail};
-use atproto_identity::key::{KeyData, KeyType, generate_key};
-use atproto_identity::resolve::{resolve_did_document, resolve_handle_http};
-use atproto_oauth::dpop::{auth_dpop, dpop_with_nonce};
-use atproto_oauth::pkce;
-use atproto_oauth::resources::pds_resources;
-use atproto_oauth::workflow::{ParResponse, TokenResponse, bind_response_issuer, generate_state};
-use godot::prelude::*;
+use atproto_identity::resolve::resolve_handle_http;
+use atproto_identity::{
+    key::{KeyData, KeyType, generate_key},
+    plc,
+};
+use atproto_oauth::{
+    dpop::auth_dpop,
+    jwt::mint,
+    pkce,
+    resources::pds_resources,
+    workflow::{ParResponse, TokenResponse},
+};
+use rand::distr::{Alphanumeric, SampleString};
 use reqwest::StatusCode;
 use serde::de::DeserializeOwned;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-const PLC_DIRECTORY: &str = "https://plc.directory";
+use godot::prelude::*;
+
+const PLC_HOSTNAME: &str = "plc.directory";
 const REDIRECT_PATH: &str = "/callback";
 const CALLBACK_TIMEOUT: Duration = Duration::from_secs(300);
 
@@ -55,15 +65,21 @@ impl INode for AtprotoClient {
         loop {
             match rx.try_recv() {
                 Ok(SignInEvent::AuthorizeUrl(url)) => {
-                    self.signals().authorize_url_ready().emit(&GString::from(url));
+                    self.signals()
+                        .authorize_url_ready()
+                        .emit(&GString::from(url.as_str()));
                 }
                 Ok(SignInEvent::Completed(did)) => {
                     self.did = Some(did.clone());
-                    self.signals().sign_in_completed().emit(&GString::from(did));
+                    self.signals()
+                        .sign_in_completed()
+                        .emit(&GString::from(did.as_str()));
                     return;
                 }
                 Ok(SignInEvent::Failed(message)) => {
-                    self.signals().sign_in_failed().emit(&GString::from(message));
+                    self.signals()
+                        .sign_in_failed()
+                        .emit(&GString::from(message.as_str()));
                     return;
                 }
                 Err(TryRecvError::Empty) => {
@@ -107,9 +123,10 @@ impl AtprotoClient {
     }
 
     /// The DID of the last completed sign-in, or an empty string.
+    /// TODO: Can we return an error instead if self.did == None?
     #[func]
     fn get_did(&self) -> GString {
-        self.did.clone().unwrap_or_default().into()
+        GString::from(self.did.as_deref().unwrap_or(""))
     }
 }
 
@@ -137,13 +154,19 @@ async fn sign_in(handle: &str, tx: &Sender<SignInEvent>) -> anyhow::Result<Strin
         .build()?;
 
     let did = resolve_handle_http(&http, handle).await?;
-    let document = resolve_did_document(&http, PLC_DIRECTORY, &did).await?;
+    if !did.starts_with("did:plc:") {
+        // FIXME: Is this true? What is the constraint?
+        bail!("only did:plc identities are supported, got {did}");
+    }
+    let document = plc::query(&http, PLC_HOSTNAME, &did).await?;
     let pds = document
         .pds_endpoints()
         .first()
-        .cloned()
+        .map(|pds| pds.to_string())
         .ok_or_else(|| anyhow!("DID document for {did} names no PDS"))?;
-    let (_, server) = pds_resources(&http, &pds).await?;
+    let (_, server) = pds_resources(&http, &pds)
+        .await
+        .map_err(|e| anyhow!("{e:?}"))?;
 
     // Bind the loopback listener first: its port goes into the redirect_uri.
     let std_listener = TcpListener::bind("127.0.0.1:0").context("binding loopback listener")?;
@@ -152,22 +175,21 @@ async fn sign_in(handle: &str, tx: &Sender<SignInEvent>) -> anyhow::Result<Strin
     let listener = tokio::net::TcpListener::from_std(std_listener)?;
     let redirect_uri = format!("http://127.0.0.1:{port}{REDIRECT_PATH}");
 
-    // Localhost dev client: the localhost exception declares redirect_uri and
-    // scope in the query, and the port is ignored when matching.
-    let client_id = url::Url::parse_with_params(
-        "http://localhost/",
-        &[
-            ("redirect_uri", format!("http://127.0.0.1{REDIRECT_PATH}")),
-            ("scope", "atproto".to_string()),
-        ],
-    )?
-    .to_string();
+    // Localhost dev client: redirect_uri and scope go in the client_id query,
+    // and the port is ignored when matching the loopback redirect.
+    let client_id = format!(
+        "http://localhost?{}",
+        url::form_urlencoded::Serializer::new(String::new())
+            .append_pair("redirect_uri", &format!("http://127.0.0.1{REDIRECT_PATH}"))
+            .append_pair("scope", "atproto")
+            .finish()
+    );
 
     let dpop_key = generate_key(KeyType::P256Private)?;
     let (verifier, challenge) = pkce::generate();
-    let state = generate_state();
+    let state = Alphanumeric.sample_string(&mut rand::rng(), 32);
 
-    let par: ParResponse = post_with_dpop(
+    let par: ParResponse = post_form(
         &http,
         &dpop_key,
         &server.pushed_authorization_request_endpoint,
@@ -201,10 +223,24 @@ async fn sign_in(handle: &str, tx: &Sender<SignInEvent>) -> anyhow::Result<Strin
     if callback.state.as_deref() != Some(state.as_str()) {
         bail!("callback state does not match the request");
     }
-    bind_response_issuer(&server.issuer, callback.issuer.as_deref())?;
-    let code = callback.code.context("callback carried no authorization code")?;
+    // RFC 9207 mix-up defence: a returned iss must match the authorization server.
+    match callback.issuer.as_deref() {
+        Some(iss) if iss != server.issuer => {
+            bail!(
+                "callback iss {iss} does not match authorization server {}",
+                server.issuer
+            )
+        }
+        None if server.authorization_response_iss_parameter_supported => {
+            bail!("callback is missing the required iss parameter")
+        }
+        _ => {}
+    }
+    let code = callback
+        .code
+        .context("callback carried no authorization code")?;
 
-    let token: TokenResponse = post_with_dpop(
+    let token: TokenResponse = post_form(
         &http,
         &dpop_key,
         &server.token_endpoint,
@@ -224,44 +260,57 @@ async fn sign_in(handle: &str, tx: &Sender<SignInEvent>) -> anyhow::Result<Strin
     }
 }
 
-/// POSTs a form with a DPoP proof, retrying once with the server's nonce when it asks for one.
-async fn post_with_dpop<T: DeserializeOwned>(
+/// Builds a DPoP proof for a POST, optionally carrying a server-issued nonce.
+fn dpop_proof(key: &KeyData, url: &str, nonce: Option<&str>) -> anyhow::Result<String> {
+    let (proof, header, mut claims) = auth_dpop(key, "POST", url)?;
+    match nonce {
+        None => Ok(proof),
+        Some(nonce) => {
+            claims.private.insert("nonce".to_string(), nonce.into());
+            mint(key, &header, &claims)
+        }
+    }
+}
+
+/// POSTs a form with a DPoP proof, retrying once with the server's nonce on a
+/// `use_dpop_nonce` challenge.
+async fn post_form<T: DeserializeOwned>(
     http: &reqwest::Client,
     key: &KeyData,
     url: &str,
     form: &[(&str, &str)],
 ) -> anyhow::Result<T> {
-    let (proof, _, _) = auth_dpop(key, "POST", url)?;
-    let mut response = http
-        .post(url)
-        .header("DPoP", proof)
-        .form(form)
-        .send()
-        .await?;
+    let mut nonce: Option<String> = None;
+    for attempt in 0..2 {
+        let proof = dpop_proof(key, url, nonce.as_deref())?;
+        let response = http
+            .post(url)
+            .header("DPoP", proof)
+            .form(form)
+            .send()
+            .await?;
 
-    if response.status() == StatusCode::BAD_REQUEST {
-        let nonce = response
+        let status = response.status();
+        let server_nonce = response
             .headers()
             .get("DPoP-Nonce")
             .and_then(|value| value.to_str().ok())
             .map(str::to_owned);
-        if let Some(nonce) = nonce {
-            let (proof, _, _) = dpop_with_nonce(key, "POST", url, None, &nonce)?;
-            response = http
-                .post(url)
-                .header("DPoP", proof)
-                .form(form)
-                .send()
-                .await?;
-        }
-    }
 
-    let status = response.status();
-    if !status.is_success() {
+        if status.is_success() {
+            return Ok(response.json::<T>().await?);
+        }
+        if attempt == 0
+            && status == StatusCode::BAD_REQUEST
+            && let Some(server_nonce) = server_nonce
+        {
+            nonce = Some(server_nonce);
+            continue;
+        }
         let body = response.text().await.unwrap_or_default();
         bail!("POST {url} failed with {status}: {body}");
     }
-    Ok(response.json::<T>().await?)
+    bail!("POST {url} did not succeed after a DPoP nonce retry")
 }
 
 struct CallbackParams {
@@ -282,7 +331,9 @@ async fn accept_callback(listener: &tokio::net::TcpListener) -> anyhow::Result<C
         if !target.starts_with(REDIRECT_PATH) {
             let mut stream = reader.into_inner();
             stream
-                .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .write_all(
+                    b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
                 .await?;
             continue;
         }
@@ -304,6 +355,7 @@ async fn accept_callback(listener: &tokio::net::TcpListener) -> anyhow::Result<C
             }
         }
 
+        // FIXME: Allow for customizing this body.
         let body = "<html><body><p>Sign-in finished. You can close this tab.</p></body></html>";
         let mut stream = reader.into_inner();
         stream

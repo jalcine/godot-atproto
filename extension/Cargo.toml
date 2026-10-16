@@ -10,10 +10,12 @@ crate-type = ["cdylib"]
 [dependencies]
 godot = { version = "0.5.5", features = ["api-4-6"] }
 anyhow = "1"
-tokio = { version = "1", features = ["rt", "net", "io-util", "time"] }
+tokio = { version = "1", features = ["rt", "net", "io-util", "time", "sync", "macros"] }
 url = "2"
 atproto-identity = "0.14.5"
 atproto-oauth = "0.14.5"
 serde = "1"
 rand = "0.9"
-reqwest = "0.12.28"
+reqwest = { version = "0.12.28", features = ["json"] }
+serde_json = "1"
+chrono = "0.4.45"

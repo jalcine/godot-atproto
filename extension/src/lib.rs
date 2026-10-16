@@ -1,22 +1,30 @@
-use std::net::TcpListener;
-use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
-use std::time::Duration;
+use std::{
+    net::TcpListener,
+    sync::mpsc::{self, Receiver, Sender, TryRecvError},
+    time::Duration,
+};
 
 use anyhow::{Context, anyhow, bail};
-use atproto_identity::key::{KeyData, KeyType, generate_key};
-use atproto_identity::plc;
-use atproto_identity::resolve::resolve_handle_http;
-use atproto_oauth::dpop::{auth_dpop, request_dpop};
-use atproto_oauth::jwt::mint;
-use atproto_oauth::pkce;
-use atproto_oauth::resources::pds_resources;
-use atproto_oauth::workflow::{ParResponse, TokenResponse};
+use atproto_identity::{
+    key::{KeyData, KeyType, generate_key},
+    plc,
+    resolve::resolve_handle_http,
+};
+use atproto_oauth::{
+    dpop::{auth_dpop, request_dpop},
+    jwt::mint,
+    pkce,
+    resources::pds_resources,
+    workflow::{ParResponse, TokenResponse},
+};
 use rand::distr::{Alphanumeric, SampleString};
 use reqwest::StatusCode;
 use serde::de::DeserializeOwned;
-use serde_json::{Value, json};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::sync::oneshot;
+use serde_json::Value;
+use tokio::{
+    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    sync::oneshot,
+};
 
 use godot::prelude::*;
 
@@ -73,7 +81,9 @@ impl INode for AtprotoClient {
         loop {
             match rx.try_recv() {
                 Ok(SignInEvent::AuthorizeUrl(url)) => {
-                    self.signals().authorize_url_ready().emit(&GString::from(url.as_str()));
+                    self.signals()
+                        .authorize_url_ready()
+                        .emit(&GString::from(url.as_str()));
                 }
                 Ok(SignInEvent::Completed(session)) => {
                     let did = GString::from(session.did.as_str());
@@ -89,7 +99,9 @@ impl INode for AtprotoClient {
                 }
                 Ok(SignInEvent::Failed(message)) => {
                     self.cancel = None;
-                    self.signals().sign_in_failed().emit(&GString::from(message.as_str()));
+                    self.signals()
+                        .sign_in_failed()
+                        .emit(&GString::from(message.as_str()));
                     return;
                 }
                 Err(TryRecvError::Empty) => {
@@ -178,29 +190,11 @@ impl AtprotoClient {
     /// It is DPoP-bound and is only usable together with the DPoP key, which is not exposed.
     #[func]
     fn get_access_token(&self) -> GString {
-        GString::from(self.session.as_ref().map_or("", |s| s.access_token.as_str()))
-    }
-
-    /// Creates an `app.bsky.feed.post` with `text` in the signed-in repo.
-    /// Returns the record URI, or an empty string on failure or when signed out.
-    /// Blocks the main thread for the network round trip.
-    #[func]
-    fn create_post(&self, text: GString) -> GString {
-        let Some(session) = self.session.as_ref() else {
-            return GString::new();
-        };
-        let record = json!({
-            "$type": "app.bsky.feed.post",
-            "text": text.to_string(),
-            "createdAt": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
-        });
-        match run_blocking(create_record(session, "app.bsky.feed.post", record)) {
-            Ok(uri) => GString::from(uri.as_str()),
-            Err(error) => {
-                godot_error!("create_post failed: {error:#}");
-                GString::new()
-            }
-        }
+        GString::from(
+            self.session
+                .as_ref()
+                .map_or("", |s| s.access_token.as_str()),
+        )
     }
 
     /// Reads a record from the signed-in repo. Returns its JSON value, or an
@@ -211,10 +205,82 @@ impl AtprotoClient {
         let Some(session) = self.session.as_ref() else {
             return GString::new();
         };
-        match run_blocking(get_record_json(session, &collection.to_string(), &rkey.to_string())) {
-            Ok(value) => GString::from(value.to_string().as_str()),
+        let params = [
+            ("repo".to_string(), session.did.clone()),
+            ("collection".to_string(), collection.to_string()),
+            ("rkey".to_string(), rkey.to_string()),
+        ];
+        match run_blocking(xrpc_call(
+            session,
+            reqwest::Method::GET,
+            "com.atproto.repo.getRecord",
+            &params,
+            None,
+        )) {
+            Ok(response) => GString::from(response["value"].to_string().as_str()),
             Err(error) => {
                 godot_error!("get_record failed: {error:#}");
+                GString::new()
+            }
+        }
+    }
+
+    /// Calls any XRPC query (GET). `params` become the query string. Returns the
+    /// JSON response, or an empty string on failure or when signed out.
+    /// Blocks the main thread for the network round trip.
+    #[func]
+    fn xrpc_query(&self, nsid: GString, params: Dictionary<GString, GString>) -> GString {
+        let Some(session) = self.session.as_ref() else {
+            return GString::new();
+        };
+        let params: Vec<(String, String)> = params
+            .iter_shared()
+            .map(|(key, value)| (key.to_string(), value.to_string()))
+            .collect();
+        match run_blocking(xrpc_call(
+            session,
+            reqwest::Method::GET,
+            &nsid.to_string(),
+            &params,
+            None,
+        )) {
+            Ok(value) => GString::from(value.to_string().as_str()),
+            Err(error) => {
+                godot_error!("xrpc_query failed: {error:#}");
+                GString::new()
+            }
+        }
+    }
+
+    /// Calls any XRPC procedure (POST). `body_json` is the JSON request body, or
+    /// empty for none. Returns the JSON response, or an empty string on failure
+    /// or when signed out. Blocks the main thread for the network round trip.
+    #[func]
+    fn xrpc_procedure(&self, nsid: GString, body_json: GString) -> GString {
+        let Some(session) = self.session.as_ref() else {
+            return GString::new();
+        };
+        let body = if body_json.is_empty() {
+            None
+        } else {
+            match serde_json::from_str::<Value>(&body_json.to_string()) {
+                Ok(body) => Some(body),
+                Err(error) => {
+                    godot_error!("xrpc_procedure body is not JSON: {error}");
+                    return GString::new();
+                }
+            }
+        };
+        match run_blocking(xrpc_call(
+            session,
+            reqwest::Method::POST,
+            &nsid.to_string(),
+            &[],
+            body.as_ref(),
+        )) {
+            Ok(value) => GString::from(value.to_string().as_str()),
+            Err(error) => {
+                godot_error!("xrpc_procedure failed: {error:#}");
                 GString::new()
             }
         }
@@ -236,10 +302,18 @@ async fn xrpc(
     url: &str,
     body: Option<&Value>,
 ) -> anyhow::Result<Value> {
-    let http = reqwest::Client::builder().timeout(Duration::from_secs(15)).build()?;
+    let http = reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()?;
     let mut nonce: Option<String> = None;
     for attempt in 0..2 {
-        let proof = request_proof(&session.dpop_key, method.as_str(), url, &session.access_token, nonce.as_deref())?;
+        let proof = request_proof(
+            &session.dpop_key,
+            method.as_str(),
+            url,
+            &session.access_token,
+            nonce.as_deref(),
+        )?;
         let mut request = http
             .request(method.clone(), url)
             .header("Authorization", format!("DPoP {}", session.access_token))
@@ -256,7 +330,12 @@ async fn xrpc(
             .map(str::to_owned);
 
         if status.is_success() {
-            return Ok(response.json::<Value>().await?);
+            let text = response.text().await?;
+            return Ok(if text.is_empty() {
+                Value::Null
+            } else {
+                serde_json::from_str(&text)?
+            });
         }
         if attempt == 0 && status == StatusCode::UNAUTHORIZED {
             if let Some(server_nonce) = server_nonce {
@@ -288,35 +367,42 @@ fn request_proof(
     }
 }
 
-/// `com.atproto.repo.createRecord`: returns the new record's `at://` URI.
-async fn create_record(session: &Session, collection: &str, record: Value) -> anyhow::Result<String> {
-    let url = format!("{}/xrpc/com.atproto.repo.createRecord", session.pds.trim_end_matches('/'));
-    let body = json!({
-        "repo": session.did,
-        "collection": collection,
-        "record": record,
-    });
-    let response = xrpc(session, reqwest::Method::POST, &url, Some(&body)).await?;
-    response["uri"]
-        .as_str()
-        .map(str::to_owned)
-        .ok_or_else(|| anyhow!("createRecord response has no uri: {response}"))
+/// Calls any XRPC method on the signed-in PDS. `nsid` must be a dotted NSID
+/// with at least three segments; the shape is checked, not resolved.
+async fn xrpc_call(
+    session: &Session,
+    method: reqwest::Method,
+    nsid: &str,
+    params: &[(String, String)],
+    body: Option<&Value>,
+) -> anyhow::Result<Value> {
+    let segments: Vec<&str> = nsid.split('.').collect();
+    let well_formed = segments.len() >= 3
+        && segments.iter().all(|segment| {
+            !segment.is_empty()
+                && segment
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-')
+        });
+    if !well_formed {
+        bail!("invalid NSID: {nsid:?}");
+    }
+    let mut url = url::Url::parse(&format!(
+        "{}/xrpc/{nsid}",
+        session.pds.trim_end_matches('/')
+    ))?;
+    if !params.is_empty() {
+        url.query_pairs_mut().extend_pairs(params);
+    }
+    xrpc(session, method, url.as_str(), body).await
 }
 
-/// `com.atproto.repo.getRecord`: returns the record's `value` object.
-async fn get_record_json(session: &Session, collection: &str, rkey: &str) -> anyhow::Result<Value> {
-    let url = url::Url::parse_with_params(
-        &format!("{}/xrpc/com.atproto.repo.getRecord", session.pds.trim_end_matches('/')),
-        &[("repo", session.did.as_str()), ("collection", collection), ("rkey", rkey)],
-    )?;
-    let response = xrpc(session, reqwest::Method::GET, url.as_str(), None).await?;
-    response
-        .get("value")
-        .cloned()
-        .ok_or_else(|| anyhow!("getRecord response has no value: {response}"))
-}
-
-fn run_sign_in_thread(handle: String, scope: String, tx: Sender<SignInEvent>, cancel_rx: oneshot::Receiver<()>) {
+fn run_sign_in_thread(
+    handle: String,
+    scope: String,
+    tx: Sender<SignInEvent>,
+    cancel_rx: oneshot::Receiver<()>,
+) {
     let outcome = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -357,7 +443,9 @@ async fn sign_in(handle: &str, scope: &str, tx: &Sender<SignInEvent>) -> anyhow:
         .first()
         .map(|pds| pds.to_string())
         .ok_or_else(|| anyhow!("DID document for {did} names no PDS"))?;
-    let (_, server) = pds_resources(&http, &pds).await.map_err(|e| anyhow!("{e:?}"))?;
+    let (_, server) = pds_resources(&http, &pds)
+        .await
+        .map_err(|e| anyhow!("{e:?}"))?;
 
     // Bind the loopback listener first: its port goes into the redirect_uri.
     let std_listener = TcpListener::bind("127.0.0.1:0").context("binding loopback listener")?;
@@ -417,14 +505,19 @@ async fn sign_in(handle: &str, scope: &str, tx: &Sender<SignInEvent>) -> anyhow:
     // RFC 9207 mix-up defence: a returned iss must match the authorization server.
     match callback.issuer.as_deref() {
         Some(iss) if iss != server.issuer => {
-            bail!("callback iss {iss} does not match authorization server {}", server.issuer)
+            bail!(
+                "callback iss {iss} does not match authorization server {}",
+                server.issuer
+            )
         }
         None if server.authorization_response_iss_parameter_supported => {
             bail!("callback is missing the required iss parameter")
         }
         _ => {}
     }
-    let code = callback.code.context("callback carried no authorization code")?;
+    let code = callback
+        .code
+        .context("callback carried no authorization code")?;
 
     let token: TokenResponse = post_form(
         &http,
@@ -491,11 +584,12 @@ async fn post_form<T: DeserializeOwned>(
         if status.is_success() {
             return Ok(response.json::<T>().await?);
         }
-        if attempt == 0 && status == StatusCode::BAD_REQUEST {
-            if let Some(server_nonce) = server_nonce {
-                nonce = Some(server_nonce);
-                continue;
-            }
+        if attempt == 0
+            && status == StatusCode::BAD_REQUEST
+            && let Some(server_nonce) = server_nonce
+        {
+            nonce = Some(server_nonce);
+            continue;
         }
         let body = response.text().await.unwrap_or_default();
         bail!("POST {url} failed with {status}: {body}");
@@ -521,7 +615,11 @@ async fn accept_callback(listener: &tokio::net::TcpListener) -> anyhow::Result<C
         if !target.starts_with(REDIRECT_PATH) {
             let mut stream = reader.into_inner();
             stream
-                .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .write_all(
+                    // FIXME: Let's allow for this body to be used as the default but allow for
+                    // an asset to be streamed or a string value to be used.
+                    b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
                 .await?;
             continue;
         }
@@ -543,6 +641,8 @@ async fn accept_callback(listener: &tokio::net::TcpListener) -> anyhow::Result<C
             }
         }
 
+        // FIXME: Let's allow for this body to be used as the default but allow for
+        // an asset to be streamed or a string value to be used.
         let body = "<html><body><p>Sign-in finished. You can close this tab.</p></body></html>";
         let mut stream = reader.into_inner();
         stream
@@ -561,3 +661,6 @@ async fn accept_callback(listener: &tokio::net::TcpListener) -> anyhow::Result<C
         return Ok(params);
     }
 }
+
+#[cfg(test)]
+mod tests;

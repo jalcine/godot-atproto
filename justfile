@@ -21,6 +21,10 @@ run: build
 run-jetstream: build
     {{godot}} --path examples/jetstream
 
+# Run the rpg.actor example, combining AtprotoClient with the public rpg.actor API
+run-rpg-actor: build
+    {{godot}} --path examples/rpg.actor
+
 # Open the example game in the Godot editor
 edit: build
     {{godot}} --editor --path {{example}}

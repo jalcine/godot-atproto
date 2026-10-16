@@ -79,7 +79,7 @@ fn xrpc_call_rejects_malformed_nsid_before_any_request() {
     // The shape check bails first, so this unreachable PDS is never contacted.
     let session = test_session("http://127.0.0.1:1");
     for nsid in ["", "com", "com..example", "com.example.bad!"] {
-        let result = run_blocking(xrpc_call(&session, reqwest::Method::GET, nsid, &[], None));
+        let result = run_blocking(xrpc_call(&session, reqwest::Method::GET, nsid, &[], None, None));
         assert!(result.is_err(), "{nsid:?} should be rejected");
     }
 }
@@ -98,6 +98,7 @@ fn get_sends_percent_encoded_params_auth_and_dpop_then_parses_json() {
             reqwest::Method::GET,
             "com.example.thing",
             &params,
+            None,
             None,
         )
         .await?;
@@ -128,6 +129,7 @@ fn post_sends_json_body() {
             "com.example.thing",
             &[],
             Some(&body),
+            None,
         )
         .await?;
         let requests = server.await??;
@@ -153,6 +155,7 @@ fn empty_success_body_maps_to_null() {
             reqwest::Method::POST,
             "com.example.thing",
             &[],
+            None,
             None,
         )
         .await?;
@@ -184,6 +187,7 @@ fn retries_once_with_server_nonce_on_401() {
             "com.example.thing",
             &[],
             None,
+            None,
         )
         .await?;
         let requests = server.await??;
@@ -205,6 +209,7 @@ fn unauthorized_without_nonce_fails_without_retry() {
             reqwest::Method::GET,
             "com.example.thing",
             &[],
+            None,
             None,
         )
         .await
@@ -230,6 +235,7 @@ fn error_status_and_body_are_reported() {
             "com.example.thing",
             &[],
             Some(&json!({})),
+            None,
         )
         .await
         .expect_err("400 must fail");

@@ -1,6 +1,7 @@
 use std::{
     net::TcpListener,
     sync::mpsc::{self, Receiver, Sender, TryRecvError},
+    path::{Path, PathBuf},
     time::Duration,
 };
 
@@ -66,6 +67,8 @@ pub struct AtprotoClient {
     events: Option<Receiver<SignInEvent>>,
     cancel: Option<oneshot::Sender<()>>,
     session: Option<Session>,
+    user_agent: Option<String>,
+    pages: CallbackPages,
 }
 
 #[godot_api]
@@ -137,6 +140,41 @@ impl AtprotoClient {
         env!("CARGO_PKG_VERSION").into()
     }
 
+    /// Sets the User-Agent sent with every request. An empty string clears it,
+    /// which leaves reqwest's default (none). Applies to later requests.
+    #[func]
+    fn set_user_agent(&mut self, user_agent: GString) {
+        let user_agent = user_agent.to_string();
+        self.user_agent = (!user_agent.is_empty()).then_some(user_agent);
+    }
+
+    /// Sets the page for the redirect that completes sign-in: `""` for the
+    /// built-in page, `html:<markup>` for inline HTML, or `file:<path>` to
+    /// stream a file. Returns false if the value has no recognised prefix.
+    #[func]
+    fn set_success_page(&mut self, page: GString) -> bool {
+        match parse_callback_page(&page.to_string()) {
+            Some(page) => {
+                self.pages.success = page;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Sets the page for any other request to the loopback server. Same format
+    /// as `set_success_page`.
+    #[func]
+    fn set_not_found_page(&mut self, page: GString) -> bool {
+        match parse_callback_page(&page.to_string()) {
+            Some(page) => {
+                self.pages.not_found = page;
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Starts sign-in for a handle. Returns false if a sign-in is already running.
     #[func]
     fn sign_in(&mut self, handle: GString, scope: GString) -> bool {
@@ -149,7 +187,11 @@ impl AtprotoClient {
         self.cancel = Some(cancel_tx);
         let handle = handle.to_string();
         let scope = scope.to_string();
-        std::thread::spawn(move || run_sign_in_thread(handle, scope, tx, cancel_rx));
+        let user_agent = self.user_agent.clone();
+        let pages = self.pages.clone();
+        std::thread::spawn(move || {
+            run_sign_in_thread(handle, scope, user_agent, pages, tx, cancel_rx)
+        });
         true
     }
 
@@ -216,6 +258,7 @@ impl AtprotoClient {
             "com.atproto.repo.getRecord",
             &params,
             None,
+            self.user_agent.as_deref(),
         )) {
             Ok(response) => GString::from(response["value"].to_string().as_str()),
             Err(error) => {
@@ -243,6 +286,7 @@ impl AtprotoClient {
             &nsid.to_string(),
             &params,
             None,
+            self.user_agent.as_deref(),
         )) {
             Ok(value) => GString::from(value.to_string().as_str()),
             Err(error) => {
@@ -277,6 +321,7 @@ impl AtprotoClient {
             &nsid.to_string(),
             &[],
             body.as_ref(),
+            self.user_agent.as_deref(),
         )) {
             Ok(value) => GString::from(value.to_string().as_str()),
             Err(error) => {
@@ -301,8 +346,9 @@ async fn xrpc(
     method: reqwest::Method,
     url: &str,
     body: Option<&Value>,
+    user_agent: Option<&str>,
 ) -> anyhow::Result<Value> {
-    let http = reqwest::Client::builder()
+    let http = with_user_agent(reqwest::Client::builder(), user_agent)
         .timeout(Duration::from_secs(15))
         .build()?;
     let mut nonce: Option<String> = None;
@@ -368,13 +414,13 @@ fn request_proof(
 }
 
 /// Calls any XRPC method on the signed-in PDS. `nsid` must be a dotted NSID
-/// with at least three segments; the shape is checked, not resolved.
 async fn xrpc_call(
     session: &Session,
     method: reqwest::Method,
     nsid: &str,
     params: &[(String, String)],
     body: Option<&Value>,
+    user_agent: Option<&str>,
 ) -> anyhow::Result<Value> {
     let segments: Vec<&str> = nsid.split('.').collect();
     let well_formed = segments.len() >= 3
@@ -394,12 +440,14 @@ async fn xrpc_call(
     if !params.is_empty() {
         url.query_pairs_mut().extend_pairs(params);
     }
-    xrpc(session, method, url.as_str(), body).await
+    xrpc(session, method, url.as_str(), body, user_agent).await
 }
 
 fn run_sign_in_thread(
     handle: String,
     scope: String,
+    user_agent: Option<String>,
+    pages: CallbackPages,
     tx: Sender<SignInEvent>,
     cancel_rx: oneshot::Receiver<()>,
 ) {
@@ -410,7 +458,7 @@ fn run_sign_in_thread(
         .and_then(|runtime| {
             runtime.block_on(async {
                 tokio::select! {
-                    result = sign_in(&handle, &scope, &tx) => result.map(Some),
+                    result = sign_in(&handle, &scope, user_agent.as_deref(), &pages, &tx) => result.map(Some),
                     _ = cancel_rx => Ok(None),
                 }
             })
@@ -427,8 +475,14 @@ fn run_sign_in_thread(
 ///
 /// The `client_id` is the atproto localhost development client, so no hosted
 /// metadata is needed. The authorization server must support that exception.
-async fn sign_in(handle: &str, scope: &str, tx: &Sender<SignInEvent>) -> anyhow::Result<Session> {
-    let http = reqwest::Client::builder()
+async fn sign_in(
+    handle: &str,
+    scope: &str,
+    user_agent: Option<&str>,
+    pages: &CallbackPages,
+    tx: &Sender<SignInEvent>,
+) -> anyhow::Result<Session> {
+    let http = with_user_agent(reqwest::Client::builder(), user_agent)
         .redirect(reqwest::redirect::Policy::none())
         .timeout(Duration::from_secs(15))
         .build()?;
@@ -495,7 +549,7 @@ async fn sign_in(handle: &str, scope: &str, tx: &Sender<SignInEvent>) -> anyhow:
     .to_string();
     let _ = tx.send(SignInEvent::AuthorizeUrl(authorize_url));
 
-    let callback = tokio::time::timeout(CALLBACK_TIMEOUT, accept_callback(&listener))
+    let callback = tokio::time::timeout(CALLBACK_TIMEOUT, accept_callback(&listener, pages))
         .await
         .context("timed out waiting for the browser redirect")??;
 
@@ -603,24 +657,45 @@ struct CallbackParams {
     issuer: Option<String>,
 }
 
+/// What the loopback server sends as a response body.
+#[derive(Clone, Default)]
+enum CallbackPage {
+    /// The built-in page for that response.
+    #[default]
+    Default,
+    /// Inline HTML.
+    Html(String),
+    /// Streamed from disk. The Content-Type comes from the file extension.
+    File(PathBuf),
+}
+
+/// The pages the browser sees during sign-in.
+#[derive(Clone, Default)]
+struct CallbackPages {
+    /// Sent for the redirect that completes sign-in.
+    success: CallbackPage,
+    /// Sent for any other request to the loopback server.
+    not_found: CallbackPage,
+}
+
+const DEFAULT_SUCCESS_HTML: &str =
+    "<html><body><p>Sign-in finished. You can close this tab.</p></body></html>";
+
 /// Accepts connections until one hits the redirect path, answers it, and returns its query.
-async fn accept_callback(listener: &tokio::net::TcpListener) -> anyhow::Result<CallbackParams> {
+async fn accept_callback(
+    listener: &tokio::net::TcpListener,
+    pages: &CallbackPages,
+) -> anyhow::Result<CallbackParams> {
     loop {
         let (stream, _) = listener.accept().await?;
         let mut reader = BufReader::new(stream);
         let mut request_line = String::new();
         reader.read_line(&mut request_line).await?;
+        let mut stream = reader.into_inner();
 
         let target = request_line.split_whitespace().nth(1).unwrap_or("/");
         if !target.starts_with(REDIRECT_PATH) {
-            let mut stream = reader.into_inner();
-            stream
-                .write_all(
-                    // FIXME: Let's allow for this body to be used as the default but allow for
-                    // an asset to be streamed or a string value to be used.
-                    b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-                )
-                .await?;
+            write_page(&mut stream, "404 Not Found", &pages.not_found, "").await?;
             continue;
         }
 
@@ -641,24 +716,104 @@ async fn accept_callback(listener: &tokio::net::TcpListener) -> anyhow::Result<C
             }
         }
 
-        // FIXME: Let's allow for this body to be used as the default but allow for
-        // an asset to be streamed or a string value to be used.
-        let body = "<html><body><p>Sign-in finished. You can close this tab.</p></body></html>";
-        let mut stream = reader.into_inner();
-        stream
-            .write_all(
-                format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                    body.len()
-                )
-                .as_bytes(),
-            )
-            .await?;
+        write_page(&mut stream, "200 OK", &pages.success, DEFAULT_SUCCESS_HTML).await?;
 
         if let Some(error) = error {
             bail!("authorization server returned error: {error}");
         }
         return Ok(params);
+    }
+}
+
+/// Writes one response whose body is `page`; `CallbackPage::Default` sends `default_html`.
+async fn write_page(
+    stream: &mut tokio::net::TcpStream,
+    status: &str,
+    page: &CallbackPage,
+    default_html: &str,
+) -> anyhow::Result<()> {
+    match page {
+        CallbackPage::Default => write_body(stream, status, default_html.as_bytes()).await,
+        CallbackPage::Html(html) => write_body(stream, status, html.as_bytes()).await,
+        CallbackPage::File(path) => {
+            let mut file = tokio::fs::File::open(path)
+                .await
+                .with_context(|| format!("opening callback page {}", path.display()))?;
+            let len = file.metadata().await?.len();
+            write_head(stream, status, content_type_for(path), len).await?;
+            tokio::io::copy(&mut file, stream).await?;
+            Ok(())
+        }
+    }
+}
+
+async fn write_body(
+    stream: &mut tokio::net::TcpStream,
+    status: &str,
+    body: &[u8],
+) -> anyhow::Result<()> {
+    write_head(stream, status, "text/html; charset=utf-8", body.len() as u64).await?;
+    stream.write_all(body).await?;
+    Ok(())
+}
+
+async fn write_head(
+    stream: &mut tokio::net::TcpStream,
+    status: &str,
+    content_type: &str,
+    len: u64,
+) -> anyhow::Result<()> {
+    let head = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {len}\r\nConnection: close\r\n\r\n"
+    );
+    stream.write_all(head.as_bytes()).await?;
+    Ok(())
+}
+
+fn content_type_for(path: &Path) -> &'static str {
+    match path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("html" | "htm") => "text/html; charset=utf-8",
+        Some("css") => "text/css; charset=utf-8",
+        Some("js") => "text/javascript; charset=utf-8",
+        Some("json") => "application/json",
+        Some("txt") => "text/plain; charset=utf-8",
+        Some("svg") => "image/svg+xml",
+        Some("png") => "image/png",
+        Some("jpg" | "jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("webp") => "image/webp",
+        _ => "application/octet-stream",
+    }
+}
+
+/// Applies a custom User-Agent when one is set. Otherwise reqwest sends none.
+fn with_user_agent(
+    builder: reqwest::ClientBuilder,
+    user_agent: Option<&str>,
+) -> reqwest::ClientBuilder {
+    match user_agent {
+        Some(user_agent) => builder.user_agent(user_agent),
+        None => builder,
+    }
+}
+
+/// Parses a callback page setting: `""` is the built-in page, `html:<markup>`
+/// is inline HTML, and `file:<path>` streams that file. Other prefixes are
+/// rejected.
+fn parse_callback_page(value: &str) -> Option<CallbackPage> {
+    if value.is_empty() {
+        Some(CallbackPage::Default)
+    } else if let Some(html) = value.strip_prefix("html:") {
+        Some(CallbackPage::Html(html.to_string()))
+    } else {
+        value
+            .strip_prefix("file:")
+            .map(|path| CallbackPage::File(PathBuf::from(path)))
     }
 }
 

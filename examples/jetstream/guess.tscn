@@ -1,0 +1,39 @@
+[gd_scene format=3]
+
+[ext_resource type="Script" path="res://guess.gd" id="1_guess"]
+
+[node name="Guess" type="Control"]
+layout_mode = 3
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+grow_horizontal = 2
+grow_vertical = 2
+script = ExtResource("1_guess")
+
+[node name="Layout" type="VBoxContainer" parent="."]
+layout_mode = 1
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+offset_left = 40.0
+offset_top = 40.0
+offset_right = -40.0
+offset_bottom = -40.0
+grow_horizontal = 2
+grow_vertical = 2
+
+[node name="Post" type="Label" parent="Layout"]
+layout_mode = 2
+autowrap_mode = 3
+
+[node name="Options" type="VBoxContainer" parent="Layout"]
+layout_mode = 2
+
+[node name="Result" type="Label" parent="Layout"]
+layout_mode = 2
+
+[node name="Next" type="Button" parent="Layout"]
+layout_mode = 2
+disabled = true
+text = "Next"

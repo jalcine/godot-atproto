@@ -17,6 +17,10 @@ test:
 run: build
     {{godot}} --path {{example}}
 
+# Run the jetstream guessing-game example
+run-jetstream: build
+    {{godot}} --path examples/jetstream
+
 # Open the example game in the Godot editor
 edit: build
     {{godot}} --editor --path {{example}}
